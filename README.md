@@ -1,4 +1,4 @@
-# Docling Experiments
+## Docling Experiments
 
 This repository contains experimental code for document intelligence using Docling, Azure OpenAI, and Streamlit. The projects explore different approaches to document processing, chunking, OCR, and question-answering.
 
