@@ -1,0 +1,28 @@
+# Core processing and utilities
+python-dotenv
+numpy
+pillow
+pymupdf
+python-docx
+openai
+
+# Docling and Text Processing
+docling
+langchain-docling
+langchain-text-splitters
+sentence-transformers
+
+# LangChain and LangGraph Ecosystem
+langchain>=0.3.0,<1.0.0
+langchain-core>=0.3.0,<1.0.0
+langchain-community>=0.3.0,<1.0.0
+langchain-openai
+langchain-milvus
+langgraph
+
+# Vector Database
+faiss-cpu
+milvus-lite
+
+# Web Interface
+streamlit
