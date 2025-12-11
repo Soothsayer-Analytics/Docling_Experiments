@@ -4,6 +4,9 @@ numpy
 pillow
 pymupdf
 python-docx
+pdfplumber
+onnxruntime
+easyocr
 openai
 
 # Docling and Text Processing
