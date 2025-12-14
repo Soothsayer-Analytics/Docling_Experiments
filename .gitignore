@@ -1,22 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
 # Data directories
 Data/
 document_databases/
 uploaded_files/
 processing_logs/
+grouped_vector_store/
 
 # Log files
 *.log
+*.log.*
 Docling.log
 Final.log
 FinalCopy.log
 
 # Environment variables
 .env
-
-# Python cache
-__pycache__/
-*.py[cod]
-*$py.class
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # IDE
 .vscode/
@@ -36,3 +64,10 @@ Thumbs.db
 *.pdf
 *.docx
 *.doc
+
+# Streamlit
+.streamlit/
+
+# System files
+.DS_Store
+Thumbs.db

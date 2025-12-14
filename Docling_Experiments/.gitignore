@@ -1,0 +1,38 @@
+# Data directories
+Data/
+document_databases/
+uploaded_files/
+processing_logs/
+
+# Log files
+*.log
+Docling.log
+Final.log
+FinalCopy.log
+
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Large files
+*.pdf
+*.docx
+*.doc
