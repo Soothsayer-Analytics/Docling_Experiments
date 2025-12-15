@@ -6,13 +6,16 @@ from tempfile import NamedTemporaryFile
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableStructureOptions
 from docling.datamodel.base_models import InputFormat
+import fitz  # PyMuPDF
+from PIL import Image
+import io
 
 # Page Config
 st.set_page_config(
     page_title="PDF Image & Table Counter",
-    page_icon="�",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+    page_icon="🔢",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 def save_uploaded_file(uploaded_file):
@@ -21,18 +24,55 @@ def save_uploaded_file(uploaded_file):
         tmp_file.write(uploaded_file.getvalue())
         return tmp_file.name
 
+def check_if_scanned(file_path):
+    """
+    Check if a PDF is likely scanned (high image area, low text).
+    Returns: (is_scanned, details_string)
+    """
+    try:
+        doc = fitz.open(file_path)
+        total_pages = len(doc)
+        scanned_pages = 0
+        
+        for page in doc:
+            # excessive logic: low text length and presence of images covering page
+            text = page.get_text()
+            images = page.get_images()
+            
+            # Simple heuristic: If text is very sparse (< 50 chars) and there are images
+            # or if the page is just one big image
+            if len(text.strip()) < 50:
+                if len(images) > 0:
+                    scanned_pages += 1
+                else:
+                    # No text, no images? might be a drawing or unrecognized content.
+                    # But for "scanned" usually means images.
+                    pass
+        
+        doc.close()
+        
+        if total_pages > 0 and (scanned_pages / total_pages) > 0.5:
+             return True, f"{scanned_pages}/{total_pages} pages appear to be scanned images."
+        return False, "Document appears to contain digital text."
+        
+    except Exception as e:
+        return False, f"Could not determine scanned status: {e}"
+
 def count_images_and_tables(file_path):
     """
     Analyze PDF and count images and tables using multiple verification methods
-    Returns: dict with verified counts
+    Returns: dict with verified counts and bounding box information
     """
+    # Check if scanned first
+    is_scanned, scanned_details = check_if_scanned(file_path)
+    
     # Configure Docling pipeline for accurate detection
     pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
+    pipeline_options.do_ocr = True # Critical for scanned docs
     pipeline_options.do_table_structure = True
     pipeline_options.table_structure_options = TableStructureOptions(
         do_cell_matching=True,
-        mode="accurate"  # Use accurate mode for better detection
+        mode="accurate"
     )
 
     converter = DocumentConverter(
@@ -45,21 +85,70 @@ def count_images_and_tables(file_path):
     result = converter.convert(file_path)
     processing_time = time.time() - start_time
     
-    # Method 1: Count from document structure (most reliable)
-    image_count_method1 = 0
-    table_count_method1 = 0
+    # Store bounding boxes for visualization
+    # We will use a set to avoid duplicates if methods overlap
+    image_bboxes = [] 
+    table_bboxes = []
     
-    try:
-        # Access the document's items directly
-        if hasattr(result.document, 'items'):
-            for item in result.document.items:
-                item_type = str(type(item).__name__).lower()
-                if 'picture' in item_type or 'image' in item_type:
-                    image_count_method1 += 1
-                elif 'table' in item_type:
-                    table_count_method1 += 1
-    except Exception as e:
-        st.warning(f"Method 1 (document structure) failed: {e}")
+    # Method 1 & 3 Combined: Analyze the JSON structure recursively
+    # This is often more reliable for finding nested items and bboxes than flat list iteration
+    json_output = result.document.export_to_dict()
+    
+    found_images_json = 0
+    found_tables_json = 0
+    
+    def extract_from_json(obj):
+        nonlocal found_images_json, found_tables_json
+        
+        if isinstance(obj, dict):
+            # Check for type
+            item_type = obj.get('label', '').lower() # Docling sometimes uses label
+            if not item_type:
+                 # fallback to checking checks like self_ref
+                 if 'self_ref' in obj and 'type' in obj: 
+                     # This might be a flat item list style
+                     pass
+            
+            # Identify by keys or explicit type fields common in Docling JSON
+            # Note: Docling's export structure varies by version. 
+            # We look for common markers for Pictures and Tables.
+            
+            is_picture = False
+            is_table = False
+            
+            # Check 'type' if present (e.g. from flattened items)
+            # Check 'label' (often 'picture', 'table')
+            
+            labels = [str(obj.get(k, '')).lower() for k in ['label', 'type', 'kind']]
+            if any('picture' in l or 'image' in l for l in labels):
+                is_picture = True
+            elif any('table' in l for l in labels):
+                is_table = True
+                
+            # Provenance / Location check
+            # Docling JSON usually has a 'prov' list for location
+            bboxes = []
+            if 'prov' in obj and isinstance(obj['prov'], list):
+                for p in obj['prov']:
+                    if 'bbox' in p and 'page_no' in p:
+                        bboxes.append((p['page_no'], p['bbox']))
+            
+            if is_picture:
+                found_images_json += 1
+                image_bboxes.extend(bboxes)
+            elif is_table:
+                found_tables_json += 1
+                table_bboxes.extend(bboxes)
+            
+            # Recurse
+            for k, v in obj.items():
+                extract_from_json(v)
+                
+        elif isinstance(obj, list):
+            for item in obj:
+                extract_from_json(item)
+
+    extract_from_json(json_output)
     
     # Method 2: Count from markdown output
     md_text = result.document.export_to_markdown()
@@ -67,207 +156,249 @@ def count_images_and_tables(file_path):
     # Count image markers in markdown
     image_count_method2 = md_text.count('<!-- image -->')
     
-    # Count tables in markdown (look for table separator pattern)
+    # Count tables in markdown
     table_count_method2 = 0
     lines = md_text.split('\n')
     for line in lines:
         stripped = line.strip()
-        # Table header separator pattern (e.g., |---|---|)
-        if '|' in stripped and '--' in stripped:
-            # Verify it's a table separator (has at least 2 columns)
-            if stripped.count('|') >= 3:  # At least |--|--| 
+        if('|' in stripped and '--' in stripped):
+             if stripped.count('|') >= 3:
                 table_count_method2 += 1
-    
-    # Method 3: Count from JSON export (additional verification)
-    image_count_method3 = 0
-    table_count_method3 = 0
-    
-    try:
-        json_output = result.document.export_to_dict()
-        
-        # Recursively search for images and tables in JSON structure
-        def count_in_dict(obj, img_count, tbl_count):
-            if isinstance(obj, dict):
-                # Check for type indicators
-                obj_type = obj.get('type', '').lower()
-                if 'picture' in obj_type or 'image' in obj_type:
-                    img_count += 1
-                elif 'table' in obj_type:
-                    tbl_count += 1
                 
-                # Recurse through all values
-                for value in obj.values():
-                    img_count, tbl_count = count_in_dict(value, img_count, tbl_count)
-            elif isinstance(obj, list):
-                for item in obj:
-                    img_count, tbl_count = count_in_dict(item, img_count, tbl_count)
-            
-            return img_count, tbl_count
-        
-        image_count_method3, table_count_method3 = count_in_dict(json_output, 0, 0)
-    except Exception as e:
-        st.warning(f"Method 3 (JSON structure) failed: {e}")
+    # Use JSON counts (Method 3) as the "Structure" count now, as it's more exhaustive than the previous Method 1
+    image_count_method1 = found_images_json
+    table_count_method1 = found_tables_json
     
-    # Double-check: Use the maximum count from all methods for accuracy
-    # This ensures we don't miss any detections
-    final_image_count = max(image_count_method1, image_count_method2, image_count_method3)
-    final_table_count = max(table_count_method1, table_count_method2, table_count_method3)
+    # Double-check: Use the maximum count
+    final_image_count = max(image_count_method1, image_count_method2)
+    final_table_count = max(table_count_method1, table_count_method2)
     
-    # Store all counts for verification display
+    # Store all counts
     verification_data = {
         'images': {
             'method1_structure': image_count_method1,
             'method2_markdown': image_count_method2,
-            'method3_json': image_count_method3,
-            'final': final_image_count
+            'final': final_image_count,
+            'bboxes': image_bboxes
         },
         'tables': {
             'method1_structure': table_count_method1,
             'method2_markdown': table_count_method2,
-            'method3_json': table_count_method3,
-            'final': final_table_count
+            'final': final_table_count,
+            'bboxes': table_bboxes
         },
-        'processing_time': processing_time
+        'processing_time': processing_time,
+        'scanned_status': {
+            'is_scanned': is_scanned,
+            'details': scanned_details
+        }
     }
     
     return verification_data
 
+def create_highlighted_pdf(pdf_path, image_bboxes, table_bboxes, output_path):
+    """
+    Create a new PDF with highlighted bounding boxes
+    """
+    doc = fitz.open(pdf_path)
+    
+    # Group bboxes by page
+    page_images = {}
+    page_tables = {}
+    
+    for page_num, bbox in image_bboxes:
+        if page_num not in page_images:
+            page_images[page_num] = []
+        page_images[page_num].append(bbox)
+    
+    for page_num, bbox in table_bboxes:
+        if page_num not in page_tables:
+            page_tables[page_num] = []
+        page_tables[page_num].append(bbox)
+    
+    count_drawn = 0
+    
+    # Draw rectangles on each page
+    for page_idx in range(len(doc)):
+        # Docling page numbers are 1-based usually
+        # We need to match page_num (from Docling) to page_idx (0-based)
+        # Assuming Docling 'page_no' 1 maps to doc[0]
+        
+        current_page_num = page_idx + 1
+        page = doc[page_idx]
+        page_height = page.rect.height
+        
+        # Draw image bboxes
+        if current_page_num in page_images:
+            for bbox in page_images[current_page_num]:
+                try:
+                    # Bbox can be dict or object depending on parsing
+                    # Docling JSON bbox: {l, t, r, b, ...} or [l, t, r, b]?
+                    # Normalized or absolute? Docling usually absolute bottom-left origin.
+                    
+                    x0, y0, x1, y1 = 0, 0, 0, 0
+                    
+                    if isinstance(bbox, dict):
+                        x0 = bbox.get('l', 0)
+                        # Flip Y: Docling is bottom-up? Check CoordOrigin.
+                        # Usually: y_top = page_height - bbox.t
+                        # But Docling V2 might use top-left origin?
+                        # Standard Docling: Bottom-Left Origin.
+                        # y0 (top of rect in PDF coords) = page_height - bbox['t'] (if t is top) 
+                        # actually:
+                        # l = left, b = bottom (y=0 is bottom), r = right, t = top
+                        # PyMuPDF: Top-Left origin.
+                        # So PyMuPDF y0 = page_height - bbox['t']
+                        # PyMuPDF y1 = page_height - bbox['b']
+                        
+                        # Let's try standard Bottom-Left conversion first
+                        t = bbox.get('t', 0)
+                        b = bbox.get('b', 0)
+                        
+                        # Note: Docling 't' is usually larger than 'b' in bottom-left coords?
+                        # No, usually t is y-coordinate of top edge (higher value), b is bottom (lower value).
+                        
+                        x0 = bbox.get('l', 0)
+                        x1 = bbox.get('r', 0)
+                        
+                        # Convert to Top-Left system
+                        rect_y0 = page_height - t
+                        rect_y1 = page_height - b
+                        
+                        # Create rect
+                        rect = fitz.Rect(x0, rect_y0, x1, rect_y1)
+                        
+                        page.draw_rect(rect, color=(0, 0, 1), width=3)
+                        page.insert_text((x0, rect_y0 - 5), "IMAGE", fontsize=12, color=(0,0,1))
+                        count_drawn += 1
+
+                except Exception as e:
+                    print(f"Error drawing bbox: {e}")
+
+        # Draw table bboxes
+        if current_page_num in page_tables:
+            for bbox in page_tables[current_page_num]:
+                try:
+                    t = bbox.get('t', 0)
+                    b = bbox.get('b', 0)
+                    x0 = bbox.get('l', 0)
+                    x1 = bbox.get('r', 0)
+                    
+                    rect_y0 = page_height - t
+                    rect_y1 = page_height - b
+                    
+                    rect = fitz.Rect(x0, rect_y0, x1, rect_y1)
+                    page.draw_rect(rect, color=(0, 0.7, 0), width=3)
+                    page.insert_text((x0, rect_y0 - 5), "TABLE", fontsize=12, color=(0, 0.7, 0))
+                    count_drawn += 1
+                except:
+                    pass
+
+    doc.save(output_path)
+    doc.close()
+    return output_path, count_drawn
+
+def pdf_to_images(pdf_path, dpi=150):
+    """Convert PDF pages to images for display"""
+    doc = fitz.open(pdf_path)
+    images = []
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=dpi)
+        img_data = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_data))
+        images.append((page_num + 1, img))
+    
+    doc.close()
+    return images
+
 def main():
     st.title("🔢 PDF Image & Table Counter")
     st.markdown("""
-    Upload a PDF to get accurate counts of **images** and **tables**.
-    
-    Uses **triple verification** to ensure accuracy:
-    - ✅ Document structure analysis
-    - ✅ Markdown output parsing
-    - ✅ JSON structure verification
+    Upload PDF(s) to get accurate counts of **images** and **tables**.
     """)
     
-    uploaded_file = st.file_uploader("📄 Upload PDF", type=['pdf'])
+    with st.sidebar:
+        st.header("📂 Upload PDFs")
+        uploaded_files = st.file_uploader(
+            "Choose PDF files", 
+            type=['pdf'], 
+            accept_multiple_files=True
+        )
+        
+        st.header("⚙️ Settings")
+        show_highlighted_pdf = st.checkbox("Show highlighted PDF", value=True)
     
-    if not uploaded_file:
-        st.info("� Upload a PDF file to start counting")
+    if not uploaded_files:
+        st.info("👆 Upload a PDF file to start")
         return
     
-    st.divider()
-    
-    # Process the document
-    file_path = save_uploaded_file(uploaded_file)
-    
-    try:
-        with st.spinner("🔍 Analyzing PDF with triple verification..."):
-            results = count_images_and_tables(file_path)
-        
-        st.success(f"✅ Analysis complete in {results['processing_time']:.2f} seconds")
-        
+    for uploaded_file in uploaded_files:
         st.divider()
+        st.header(f"📄 {uploaded_file.name}")
         
-        # Display final counts prominently
-        st.subheader("📊 Detection Results")
+        file_path = save_uploaded_file(uploaded_file)
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric(
-                label="�️ Images Detected",
-                value=results['images']['final'],
-                help="Total number of images found in the PDF"
-            )
-        
-        with col2:
-            st.metric(
-                label="📋 Tables Detected",
-                value=results['tables']['final'],
-                help="Total number of tables found in the PDF"
-            )
-        
-        st.divider()
-        
-        # Show verification details
-        with st.expander("🔍 View Verification Details", expanded=False):
-            st.markdown("### Triple Verification Breakdown")
-            st.markdown("*The final count uses the maximum from all methods to ensure accuracy*")
+        try:
+            with st.spinner("🔍 Analyzing..."):
+                results = count_images_and_tables(file_path)
             
-            st.markdown("#### 🖼️ Image Detection Methods:")
-            col1, col2, col3 = st.columns(3)
+            # Scanned Status Badge
+            if results['scanned_status']['is_scanned']:
+                st.warning(f"📷 **Scanned Document Detected**")
+                st.caption(f"Details: {results['scanned_status']['details']}")
+                st.caption("Note: Location / Bounding boxes might be approximate or missing for scanned elements.")
             
+            # Counts
+            col1, col2 = st.columns(2)
             with col1:
-                st.metric(
-                    "Method 1",
-                    results['images']['method1_structure'],
-                    help="Document structure analysis"
-                )
+                st.metric("🖼️ Images", results['images']['final'])
             with col2:
-                st.metric(
-                    "Method 2",
-                    results['images']['method2_markdown'],
-                    help="Markdown output parsing"
-                )
-            with col3:
-                st.metric(
-                    "Method 3",
-                    results['images']['method3_json'],
-                    help="JSON structure verification"
-                )
+                st.metric("📋 Tables", results['tables']['final'])
             
-            # Check if all methods agree
-            img_counts = [
-                results['images']['method1_structure'],
-                results['images']['method2_markdown'],
-                results['images']['method3_json']
-            ]
-            if len(set(img_counts)) == 1:
-                st.success("✅ All methods agree on image count")
-            else:
-                st.warning(f"⚠️ Methods differ - using maximum count ({results['images']['final']}) for accuracy")
+            # Parse Bboxes for validity (count how many we actually have)
+            valid_image_bboxes = len(results['images']['bboxes'])
+            valid_table_bboxes = len(results['tables']['bboxes'])
             
-            st.divider()
+            # Visualization
+            if show_highlighted_pdf:
+                if (valid_image_bboxes + valid_table_bboxes) > 0:
+                    st.subheader("📍 Visual Detection")
+                    
+                    highlighted_pdf_path = file_path.replace('.pdf', '_highlighted.pdf')
+                    try:
+                        _, drawn_count = create_highlighted_pdf(
+                            file_path, 
+                            results['images']['bboxes'], 
+                            results['tables']['bboxes'], 
+                            highlighted_pdf_path
+                        )
+                        
+                        if drawn_count == 0:
+                             st.warning("⚠️ Elements were detected, but could not be drawn on the PDF (coordinate mismatch).")
+                        else:
+                            images = pdf_to_images(highlighted_pdf_path)
+                            for p_num, img in images:
+                                st.image(img, caption=f"Page {p_num}", use_container_width=True)
+                                
+                    except Exception as e:
+                        st.error(f"Error creating visualization: {e}")
+                else:
+                    if (results['images']['final'] > 0 or results['tables']['final'] > 0):
+                        st.warning("⚠️ Images/Tables were detected in text/content, but no location data (bounding boxes) was returned by the analyzer.")
+                        st.info("This often happens with scanned documents where the entire page is treated as an image, or when elements are inferred from OCR text without specific coordinates.")
+                    else:
+                        st.info("No images or tables found to visualize.")
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
             
-            st.markdown("#### 📋 Table Detection Methods:")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric(
-                    "Method 1",
-                    results['tables']['method1_structure'],
-                    help="Document structure analysis"
-                )
-            with col2:
-                st.metric(
-                    "Method 2",
-                    results['tables']['method2_markdown'],
-                    help="Markdown output parsing"
-                )
-            with col3:
-                st.metric(
-                    "Method 3",
-                    results['tables']['method3_json'],
-                    help="JSON structure verification"
-                )
-            
-            # Check if all methods agree
-            tbl_counts = [
-                results['tables']['method1_structure'],
-                results['tables']['method2_markdown'],
-                results['tables']['method3_json']
-            ]
-            if len(set(tbl_counts)) == 1:
-                st.success("✅ All methods agree on table count")
-            else:
-                st.warning(f"⚠️ Methods differ - using maximum count ({results['tables']['final']}) for accuracy")
-    
-    except Exception as e:
-        import traceback
-        st.error(f"❌ An error occurred: {str(e)}")
-        with st.expander("View error details"):
-            st.code(traceback.format_exc())
-    
-    finally:
-        if os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except:
-                pass
+        finally:
+            if os.path.exists(file_path):
+                try: # cleanup
+                    os.unlink(file_path)
+                except: pass
 
 if __name__ == "__main__":
     main()
